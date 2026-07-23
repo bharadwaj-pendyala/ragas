@@ -28,14 +28,28 @@ _COLUMN_CONTEXT = {"SELECT", "WHERE", "ON", "GROUP BY", "ORDER BY", "HAVING", "S
 
 class SQLReferences(t.NamedTuple):
     tables: t.Set[str]
-    columns: t.Set[t.Tuple[t.Optional[str], str]]
+    # Columns qualified by a table name, as (table, column).
+    qualified: t.Set[t.Tuple[str, str]]
+    # Unqualified columns paired with the tables visible in their query scope,
+    # so they are validated only against those tables and never leak across
+    # subquery / CTE boundaries.
+    unqualified: t.Set[t.Tuple[t.FrozenSet[str], str]]
+
+    @property
+    def columns(self) -> t.Set[t.Tuple[t.Optional[str], str]]:
+        """Flat view of all column references for introspection and tests."""
+        flat: t.Set[t.Tuple[t.Optional[str], str]] = {
+            (table, col) for table, col in self.qualified
+        }
+        flat |= {(None, col) for _, col in self.unqualified}
+        return flat
 
 
 class _Scope:
-    """Table/column references collected within a single query scope.
+    """References collected within one query scope (a SELECT or DML statement).
 
-    A scope is one ``SELECT`` (or DML statement). Subqueries and CTEs form their
-    own nested scopes so their aliases never leak out as schema references.
+    Subqueries and CTE bodies get their own scope so their tables and aliases
+    never affect validation in the enclosing query.
     """
 
     def __init__(self) -> None:
@@ -81,8 +95,8 @@ def _collect_ctes(statement: TokenList) -> t.Set[str]:
     return ctes
 
 
-def _walk(statement: TokenList, context: str, scope: _Scope) -> None:
-    for token in statement.tokens:
+def _walk(node: TokenList, context: str, scope: _Scope, scopes: t.List[_Scope]) -> None:
+    for token in node.tokens:
         if token.is_whitespace:
             continue
 
@@ -98,28 +112,42 @@ def _walk(statement: TokenList, context: str, scope: _Scope) -> None:
             continue
 
         if isinstance(token, Where):
-            _walk(token, "COLUMN", scope)
+            _walk(token, "COLUMN", scope, scopes)
             continue
         if isinstance(token, Parenthesis):
-            _walk(token, "COLUMN", scope)
+            _descend_parenthesis(token, context, scope, scopes)
             continue
 
         if isinstance(token, (Identifier, IdentifierList)):
             for child in _tokens(token):
-                _handle(child, context, scope)
+                _handle(child, context, scope, scopes)
             continue
 
         if isinstance(token, Function):
-            _handle(token, context, scope)
+            _handle(token, context, scope, scopes)
             continue
 
         # Recurse into grouped tokens like Comparison or Operation so nested
         # identifiers (e.g. a WHERE predicate) are still classified.
         if isinstance(token, TokenList):
-            _walk(token, context, scope)
+            _walk(token, context, scope, scopes)
 
 
-def _handle(identifier: t.Any, context: str, scope: _Scope) -> None:
+def _descend_parenthesis(
+    paren: Parenthesis, context: str, scope: _Scope, scopes: t.List[_Scope]
+) -> None:
+    """A subquery gets its own scope; any other parenthesis stays in-scope."""
+    if _has_select(paren):
+        child = _Scope()
+        scopes.append(child)
+        _walk(paren, "COLUMN", child, scopes)
+    else:
+        _walk(paren, context, scope, scopes)
+
+
+def _handle(
+    identifier: t.Any, context: str, scope: _Scope, scopes: t.List[_Scope]
+) -> None:
     # A function call: its name is not a column, but its arguments may be. In a
     # table context ``table (col, col)`` also parses as a function (e.g. the
     # target of INSERT INTO), so the name is the table there.
@@ -131,7 +159,7 @@ def _handle(identifier: t.Any, context: str, scope: _Scope) -> None:
             (tok for tok in identifier.tokens if isinstance(tok, Parenthesis)), None
         )
         if paren is not None:
-            _walk(paren, "COLUMN", scope)
+            _descend_parenthesis(paren, "COLUMN", scope, scopes)
         return
     if not isinstance(identifier, Identifier):
         return
@@ -139,21 +167,14 @@ def _handle(identifier: t.Any, context: str, scope: _Scope) -> None:
     paren = next(
         (tok for tok in identifier.tokens if isinstance(tok, Parenthesis)), None
     )
-    if paren is not None:
+    if paren is not None and _has_select(paren):
+        # Derived table: (SELECT ...) alias. The alias is virtual in this scope
+        # and the subquery is walked as its own scope.
         alias = _clean(identifier.get_alias())
-        if _has_select(paren):
-            # Derived table: (SELECT ...) alias. The alias is virtual and its
-            # inner scope is walked so real tables inside are still checked.
-            if alias:
-                scope.virtual.add(alias)
-                scope.aliases.add(alias)
-            _walk(paren, "COLUMN", scope)
-            return
-        # INSERT-style ``table (col, col)``: the name is a table, parens columns.
-        name = _clean(identifier.get_real_name())
-        if name and context == "TABLE":
-            scope.tables.add(name)
-        _walk(paren, "COLUMN", scope)
+        if alias:
+            scope.virtual.add(alias)
+            scope.aliases.add(alias)
+        _descend_parenthesis(paren, "COLUMN", scope, scopes)
         return
 
     alias = _clean(identifier.get_alias())
@@ -173,32 +194,40 @@ def _handle(identifier: t.Any, context: str, scope: _Scope) -> None:
         scope.raw_columns.add((qualifier, real))
 
 
-def _resolve(scope: _Scope) -> SQLReferences:
+def _resolve(
+    scope: _Scope,
+) -> t.Tuple[
+    t.Set[str], t.Set[t.Tuple[str, str]], t.Set[t.Tuple[t.FrozenSet[str], str]]
+]:
     tables = scope.tables - scope.virtual
+    scope_tables = frozenset(tables)
 
-    columns: t.Set[t.Tuple[t.Optional[str], str]] = set()
+    qualified: t.Set[t.Tuple[str, str]] = set()
+    unqualified: t.Set[t.Tuple[t.FrozenSet[str], str]] = set()
     for qualifier, name in scope.raw_columns:
         if name in scope.aliases:
             continue
         if qualifier is None:
-            columns.add((None, name))
+            unqualified.add((scope_tables, name))
             continue
         if qualifier in scope.virtual:
             continue
         resolved = scope.alias_to_table.get(qualifier, qualifier)
         if resolved in scope.virtual:
             continue
-        columns.add((resolved, name))
+        qualified.add((resolved, name))
 
-    return SQLReferences(tables=tables, columns=columns)
+    return tables, qualified, unqualified
 
 
 def extract_references(sql: str) -> SQLReferences:
     """Extract table and column references from a SQL query.
 
     Handles multiple statements, joins, functions, subqueries, CTEs and simple
-    DML. In-query aliases and CTE / derived-table names are resolved and never
-    counted as references. ``*`` wildcards and function names are ignored.
+    DML. Subqueries and CTE bodies form their own scope, so an unqualified
+    column is validated only against the tables of its own query. In-query
+    aliases and CTE / derived-table names are resolved and never counted as
+    references. ``*`` wildcards and function names are ignored.
 
     Note: schema-qualified names deeper than ``table.column`` (e.g.
     ``db.schema.table``) are not resolved, matching the flat ``{table: columns}``
@@ -207,16 +236,20 @@ def extract_references(sql: str) -> SQLReferences:
     assert sqlparse is not None, "sqlparse is required for SQLSchemaHallucination"
 
     tables: t.Set[str] = set()
-    columns: t.Set[t.Tuple[t.Optional[str], str]] = set()
+    qualified: t.Set[t.Tuple[str, str]] = set()
+    unqualified: t.Set[t.Tuple[t.FrozenSet[str], str]] = set()
     for statement in sqlparse.parse(sql):
-        scope = _Scope()
-        scope.virtual |= _collect_ctes(statement)
-        _walk(statement, "COLUMN", scope)
-        refs = _resolve(scope)
-        tables |= refs.tables
-        columns |= refs.columns
+        root = _Scope()
+        root.virtual |= _collect_ctes(statement)
+        scopes: t.List[_Scope] = [root]
+        _walk(statement, "COLUMN", root, scopes)
+        for scope in scopes:
+            scope_tables, scope_qualified, scope_unqualified = _resolve(scope)
+            tables |= scope_tables
+            qualified |= scope_qualified
+            unqualified |= scope_unqualified
 
-    return SQLReferences(tables=tables, columns=columns)
+    return SQLReferences(tables=tables, qualified=qualified, unqualified=unqualified)
 
 
 def _normalize_schema(schema: Schema) -> t.Dict[str, t.Set[str]]:
@@ -231,19 +264,13 @@ def score_references(
 ) -> t.Tuple[int, int, t.List[str]]:
     """Count references that exist in the schema.
 
-    Unqualified columns are validated against the columns of the tables the
-    query actually references, not the whole schema, so a column that exists in
-    some unrelated table is still flagged. Returns (valid, total, hallucinated).
+    Unqualified columns are validated against the columns of the tables their
+    own query scope references, so a column that only exists in an unrelated
+    table (or in a subquery) is still flagged. Returns (valid, total,
+    hallucinated).
     """
     normalized = _normalize_schema(schema)
-
-    referenced_columns: t.Set[str] = set()
-    for table in references.tables:
-        referenced_columns |= normalized.get(table.lower(), set())
-    if not referenced_columns:
-        # No referenced table is in the schema; fall back to the whole schema so
-        # a bad table name does not also flag every column as hallucinated.
-        referenced_columns = {col for cols in normalized.values() for col in cols}
+    all_columns = {col for cols in normalized.values() for col in cols}
 
     valid = 0
     total = 0
@@ -256,16 +283,23 @@ def score_references(
         else:
             hallucinated.append(table)
 
-    for qualifier, column in references.columns:
+    for table, column in references.qualified:
         total += 1
-        col = column.lower()
-        if qualifier is not None:
-            table = qualifier.lower()
-            if table in normalized and col in normalized[table]:
-                valid += 1
-            else:
-                hallucinated.append(f"{qualifier}.{column}")
-        elif col in referenced_columns:
+        if table.lower() in normalized and column.lower() in normalized[table.lower()]:
+            valid += 1
+        else:
+            hallucinated.append(f"{table}.{column}")
+
+    for scope_tables, column in references.unqualified:
+        total += 1
+        referenced = set()
+        for table in scope_tables:
+            referenced |= normalized.get(table.lower(), set())
+        # No referenced table is in the schema; fall back to the whole schema so
+        # a bad table name does not also flag every column as hallucinated.
+        if not referenced:
+            referenced = all_columns
+        if column.lower() in referenced:
             valid += 1
         else:
             hallucinated.append(column)

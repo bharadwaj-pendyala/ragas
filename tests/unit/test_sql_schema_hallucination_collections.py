@@ -188,6 +188,26 @@ class TestSQLSchemaHallucination:
         assert "total" in result.reason
 
     @pytest.mark.asyncio
+    async def test_subquery_tables_do_not_validate_outer_columns(self):
+        metric = SQLSchemaHallucination()
+        # 'total' is in 'orders' (used only in the subquery), not in 'users'.
+        result = await metric.ascore(
+            response="SELECT total FROM users WHERE id IN (SELECT user_id FROM orders)",
+            schema=SCHEMA,
+        )
+        assert result.value < 1.0
+        assert "total" in result.reason
+
+    @pytest.mark.asyncio
+    async def test_valid_subquery_does_not_false_flag(self):
+        metric = SQLSchemaHallucination()
+        result = await metric.ascore(
+            response="SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)",
+            schema=SCHEMA,
+        )
+        assert result.value == 1.0
+
+    @pytest.mark.asyncio
     async def test_second_statement_is_scored(self):
         metric = SQLSchemaHallucination()
         result = await metric.ascore(
