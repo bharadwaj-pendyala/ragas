@@ -59,6 +59,30 @@ class TestSQLReferenceExtraction:
         assert (valid, total) == (1, 2)
         assert hallucinated == ["emial"]
 
+    def test_column_inside_function_is_extracted(self):
+        refs = extract_references("SELECT LOWER(emial) FROM users")
+        assert (None, "emial") in refs.columns
+
+    def test_derived_table_alias_is_not_scored(self):
+        refs = extract_references("SELECT x.id FROM (SELECT id FROM users) x")
+        assert refs.tables == {"users"}
+        assert ("x", "id") not in refs.columns
+
+    def test_cte_qualified_column_is_not_scored(self):
+        refs = extract_references(
+            "WITH recent AS (SELECT id FROM users) SELECT recent.id FROM recent"
+        )
+        assert ("recent", "id") not in refs.columns
+
+    def test_multiple_statements_are_all_extracted(self):
+        refs = extract_references("SELECT id FROM users; SELECT emial FROM users")
+        assert (None, "emial") in refs.columns
+
+    def test_update_target_is_a_table(self):
+        refs = extract_references("UPDATE users SET email = 'x' WHERE id = 1")
+        assert refs.tables == {"users"}
+        assert (None, "users") not in refs.columns
+
 
 class TestSQLSchemaHallucination:
     """Test cases for the SQLSchemaHallucination metric."""
@@ -137,6 +161,40 @@ class TestSQLSchemaHallucination:
         metric = SQLSchemaHallucination()
         with pytest.raises(ValueError, match="non-empty mapping"):
             await metric.ascore(response="SELECT id FROM users", schema={})
+
+    @pytest.mark.asyncio
+    async def test_hallucinated_column_inside_function(self):
+        metric = SQLSchemaHallucination()
+        result = await metric.ascore(
+            response="SELECT LOWER(emial) FROM users", schema=SCHEMA
+        )
+        assert result.value == 0.5
+        assert "emial" in result.reason
+
+    @pytest.mark.asyncio
+    async def test_derived_table_not_flagged(self):
+        metric = SQLSchemaHallucination()
+        result = await metric.ascore(
+            response="SELECT x.id FROM (SELECT id FROM users) x", schema=SCHEMA
+        )
+        assert result.value == 1.0
+
+    @pytest.mark.asyncio
+    async def test_unqualified_column_scoped_to_referenced_tables(self):
+        metric = SQLSchemaHallucination()
+        # 'total' exists in 'orders' but the query only references 'users'.
+        result = await metric.ascore(response="SELECT total FROM users", schema=SCHEMA)
+        assert result.value == 0.5
+        assert "total" in result.reason
+
+    @pytest.mark.asyncio
+    async def test_second_statement_is_scored(self):
+        metric = SQLSchemaHallucination()
+        result = await metric.ascore(
+            response="SELECT id FROM users; SELECT emial FROM users", schema=SCHEMA
+        )
+        assert result.value < 1.0
+        assert "emial" in result.reason
 
     def test_sync_score_method(self):
         metric = SQLSchemaHallucination()
