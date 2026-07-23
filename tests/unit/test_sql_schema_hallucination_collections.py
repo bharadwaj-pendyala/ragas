@@ -199,6 +199,18 @@ class TestSQLSchemaHallucination:
         assert "total" in result.reason
 
     @pytest.mark.asyncio
+    async def test_correlated_subquery_resolves_outer_alias(self):
+        metric = SQLSchemaHallucination()
+        result = await metric.ascore(
+            response=(
+                "SELECT id FROM orders o "
+                "WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.user_id)"
+            ),
+            schema=SCHEMA,
+        )
+        assert result.value == 1.0
+
+    @pytest.mark.asyncio
     async def test_valid_subquery_does_not_false_flag(self):
         metric = SQLSchemaHallucination()
         result = await metric.ascore(

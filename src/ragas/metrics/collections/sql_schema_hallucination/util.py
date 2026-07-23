@@ -52,12 +52,30 @@ class _Scope:
     never affect validation in the enclosing query.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, parent: t.Optional["_Scope"] = None) -> None:
+        self.parent = parent
         self.tables: t.Set[str] = set()
         self.alias_to_table: t.Dict[str, str] = {}
         self.virtual: t.Set[str] = set()  # CTE and derived-table names
         self.raw_columns: t.Set[t.Tuple[t.Optional[str], str]] = set()
         self.aliases: t.Set[str] = set()  # column aliases to ignore
+
+    def lookup_alias(self, name: str) -> t.Optional[str]:
+        """Resolve a table alias, walking outer scopes for correlated queries."""
+        scope: t.Optional["_Scope"] = self
+        while scope is not None:
+            if name in scope.alias_to_table:
+                return scope.alias_to_table[name]
+            scope = scope.parent
+        return None
+
+    def is_virtual(self, name: str) -> bool:
+        scope: t.Optional["_Scope"] = self
+        while scope is not None:
+            if name in scope.virtual:
+                return True
+            scope = scope.parent
+        return False
 
 
 def _clean(name: t.Optional[str]) -> t.Optional[str]:
@@ -138,7 +156,7 @@ def _descend_parenthesis(
 ) -> None:
     """A subquery gets its own scope; any other parenthesis stays in-scope."""
     if _has_select(paren):
-        child = _Scope()
+        child = _Scope(parent=scope)
         scopes.append(child)
         _walk(paren, "COLUMN", child, scopes)
     else:
@@ -210,10 +228,10 @@ def _resolve(
         if qualifier is None:
             unqualified.add((scope_tables, name))
             continue
-        if qualifier in scope.virtual:
+        if scope.is_virtual(qualifier):
             continue
-        resolved = scope.alias_to_table.get(qualifier, qualifier)
-        if resolved in scope.virtual:
+        resolved = scope.lookup_alias(qualifier) or qualifier
+        if scope.is_virtual(resolved):
             continue
         qualified.add((resolved, name))
 
